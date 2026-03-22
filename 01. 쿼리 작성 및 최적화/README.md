@@ -639,3 +639,121 @@
             - NOT EXISTS
             - 구체화
         - 두 방식 모두 큰 성능 향상을 보장하지는 않으므로, NOT IN 서브쿼리만 단독으로 둔 WHERE 조건은 풀 스캔을 피하기 어렵다.
+
+### 11.4.11 CTE(Common Table Expression)
+
+- CTE는 이름을 가진 임시 테이블처럼 SQL 문장 안에서 한 번 이상 참조할 수 있는 구문이다.
+- CTE는 재귀적 반복 실행 여부를 기준으로 비 재귀적 CTE와 재귀적 CTE로 구분한다.
+- MySQL에서 CTE는 단순 SELECT뿐 아니라 SELECT, UPDATE, DELETE, INSERT, REPLACE, CREATE TABLE, CREATE VIEW, DECLARE CURSOR, EXPLAIN 같은 문장의 앞부분에서도 사용할 수 있다.
+- 11.4.11.1 비 재귀적 CTE(Non-Recursive CTE)
+    - 문법은 `WITH cte1 AS (SELECT ...) SELECT ... FROM cte1` 형태다.
+    - 같은 SELECT 안에서 여러 개의 CTE를 정의할 수 있다.
+    - CTE는 FROM 절 서브쿼리와 비슷하게 보이지만, 동일한 임시 테이블을 여러 번 참조할 수 있다는 점이 다르다.
+    - 같은 임시 결과를 여러 번 사용하는 경우 FROM 절 서브쿼리보다 CTE가 더 효율적일 수 있다.
+    - 실행 계획 비교 예시에서는 CTE를 사용하면 동일한 derived 임시 테이블을 한 번만 만들지만, FROM 절 서브쿼리를 두 번 쓰면 각각 별도의 임시 테이블을 생성한다.
+    - CTE를 재귀적으로 쓰지 않더라도 기존 FROM 절 서브쿼리보다 다음 장점이 있다.
+        - CTE 임시 테이블은 재사용 가능하므로 FROM 절 서브쿼리보다 효율적이다.
+        - CTE로 선언된 임시 테이블을 다른 CTE 쿼리에서 참조할 수 있다.
+        - 같은 임시 테이블의 생성 부분과 사용 부분을 분리할 수 있어 가독성이 좋다.
+- 11.4.11.2 재귀적 CTE(Recursive CTE)
+    - 재귀적 CTE는 `WITH RECURSIVE cte AS (...)` 형태로 정의한다.
+    - 기본 구조는 초기 결과를 만드는 비 재귀적 파트와, 직전 결과를 다시 참조해 다음 결과를 만드는 재귀적 파트로 구성된다.
+    - 예시에서는 1부터 시작해 n+1을 반복 생성하면서 n < 5 조건까지 실행해 1부터 5까지의 결과를 만든다.
+        
+        <img width="356" height="163" alt="image" src="https://github.com/user-attachments/assets/ea7f768b-08ea-4edf-89c8-c5451ac0d4e3" />
+
+    - 재귀적 CTE는 다음 순서로 동작한다.
+        - 비 재귀적 파트 실행
+        - 결과를 CTE 임시 테이블에 저장
+        - 직전 결과를 이용해 재귀적 파트 실행
+        - 새 결과를 다시 CTE 임시 테이블에 저장
+        - 더 이상 반환할 값이 없을 때까지 반복
+    - 재귀적 CTE를 사용할 때 가장 흔한 실수는 반복 실행 종료 조건을 빠뜨리는 것이다.
+    - 종료 조건을 빠뜨리면 무한 반복을 막기 위해 MySQL이 `cte_max_recursion_depth` 한도에서 중단한다.
+    - 이 시스템 변수의 기본값은 1000이다.
+    - 필요하면 SET cte_max_recursion_depth=...로 반복 횟수 상한을 조정할 수 있다.
+- 11.4.11.3 재귀적 CTE(Recursive CTE) 활용
+    - 재귀적 CTE는 단순 숫자 증가 예제뿐 아니라 계층형 데이터를 탐색하는 데 유용하다.
+    - 첫 번째 활용 예시는 특정 사원에서 시작해 상위 조직장을 따라 올라가는 경로를 찾는 방식이다.
+        
+        <img width="698" height="410" alt="image" src="https://github.com/user-attachments/assets/2ace7ae3-2d81-4699-81be-b6c0baa27cd8" />
+
+    - 이 예시에서는 비 재귀적 파트가 시작 사원을 고르고, 재귀적 파트가 manager_id를 따라 상위 직원과 계속 조인한다.
+    - 두 번째 활용 예시는 최상위 조직장부터 시작해 하위 사원 조직도를 확장하는 방식이다.
+        
+        <img width="527" height="673" alt="image" src="https://github.com/user-attachments/assets/59199f4a-5c1d-4d9d-8f19-8a72399ce7cf" />
+
+    - 이 예시에서는 manager_path 같은 경로 문자열을 누적해서 조직 구조를 한 줄 문자열로 표현한다.
+    - 경로 문자열을 누적할 때는 재귀적 파트 결과가 더 길어지므로 칼럼 길이를 충분히 잡아야 한다.
+    - 예시에서는 CAST(id AS CHAR(100)) 같은 방식으로 문자열 타입과 길이를 미리 넉넉히 맞춘다.
+    - 그렇지 않으면 Data too long for column ... 오류가 발생할 수 있다.
+    - 재귀적 쿼리는 다음과 같은 요구사항에 활용될 수 있다.
+        - 단순 증가 수열을 가지는 임시 테이블 생성
+        - 날짜 증가 형태의 임시 테이블 생성
+        - 조직도 조회
+        - BOM 탐색
+        - 재귀적 쿼리 패턴이 필요한 기타 처리
+
+### **11.4.12 윈도우 함수(Window Function)**
+
+- 윈도우 함수는 조회된 결과 집합 안에서 행 단위 연산을 수행하면서도 각 원본 레코드를 그대로 유지할 수 있게 해주는 함수다.
+- 집계 함수는 GROUP BY로 여러 레코드를 하나의 결과로 줄이지만, 윈도우 함수는 개별 레코드를 유지한 채 집계성 계산을 덧붙일 수 있다.
+- 이 때문에 GROUP BY나 단순 집계로 해결하기 어려운 문제를 더 자연스럽게 풀 수 있다.
+- 11.4.12.1 쿼리 각 절의 실행 순서
+    
+    <img width="409" height="261" alt="image" src="https://github.com/user-attachments/assets/8f814d21-05d7-44e1-bbaa-f6b086c8acc7" />
+
+    - 윈도우 함수가 붙은 SELECT 결과는 FROM, WHERE, GROUP BY, HAVING이 모두 끝난 뒤 만들어진 중간 결과를 대상으로 계산된다.
+    - 그 뒤 최종적으로 SELECT 절과 ORDER BY, LIMIT 절이 처리된다.
+    - 그래서 GROUP BY 절이나 서브쿼리 내부의 LIMIT 결과를 기반으로 윈도우 함수를 적용하려면, 먼저 그 결과를 만드는 파생 테이블이나 서브쿼리가 필요하다.
+    - 즉 윈도우 함수 계산 대상 범위는 쿼리에서 어디에 LIMIT이나 필터가 놓였는지에 따라 달라진다.
+- 11.4.12.2 윈도우 함수 기본 사용법
+    - 기본 문법은 `AGGREGATE_FUNC() OVER(<partition> <order>)` 형태다.
+    - OVER() 절이 없으면 일반 집계 함수이고, OVER() 절이 붙으면 윈도우 함수가 된다.
+    - PARTITION BY는 전체 결과를 여러 파티션으로 나누는 역할을 한다.
+    - ORDER BY는 각 파티션 안에서 행의 순서를 정한다.
+    - PARTITION BY나 ORDER BY가 필요 없는 경우에는 생략할 수 있다.
+        
+        <img width="353" height="284" alt="image" src="https://github.com/user-attachments/assets/f810c2c8-930b-4c5a-b432-7abf35bf487e" />
+
+    - 파티션 안에서 연산할 범위를 더 세밀하게 지정하려면 frame을 사용한다.
+    - frame 문법은 다음 형태다.
+        - ROWS | RANGE ...
+        - BETWEEN frame_start AND frame_end
+    - frame 시작점과 끝점은 다음 값들을 사용할 수 있다.
+        - CURRENT ROW
+        - UNBOUNDED PRECEDING
+        - UNBOUNDED FOLLOWING
+        - expr PRECEDING
+        - expr FOLLOWING
+    - ROWS는 레코드 위치를 기준으로 범위를 정한다.
+    - RANGE는 ORDER BY 값의 범위를 기준으로 범위를 정한다.
+        
+        <img width="687" height="433" alt="image" src="https://github.com/user-attachments/assets/1fd1186b-1b59-4204-b716-49af75d36231" />
+
+    - 일부 윈도우 함수는 frame을 따로 명시하지 않으면 기본 frame이 적용된다.
+    - [주의] ORDER BY 사용 시 기본 frame과 ORDER BY 미사용 시 기본 frame이 다르므로, 결과를 정확히 통제하려면 frame을 명시하는 편이 안전하다.
+- 11.4.12.3 윈도우 함수
+    - 윈도우 함수는 집계 함수 기반과 비 집계 함수 기반으로 나뉜다.
+    - 집계 함수는 기존 집계 함수에 OVER 절을 붙여 사용할 수 있다.
+    - 비 집계 함수는 순위, 이전 행, 다음 행, 누적 분포 같은 계산을 수행한다.
+    - 11.4.12.3.1 DENSE_RANK()와 RANK(), ROW_NUMBER()
+        - 세 함수 모두 ORDER BY 기준으로 순위를 계산한다.
+        - RANK()는 동일 값이 있으면 같은 순위를 부여하고, 다음 순위는 건너뛴다.
+        - DENSE_RANK()는 동일 값에 같은 순위를 주되, 다음 순위를 건너뛰지 않는다.
+        - ROW_NUMBER()는 중복 여부와 관계없이 현재 정렬 순서대로 1부터 연속 번호를 부여한다.
+    - 11.4.12.3.2 LAG()와 LEAD()
+        - LAG()는 현재 행 기준으로 이전 행 값을 반환한다.
+        - LEAD()는 현재 행 기준으로 다음 행 값을 반환한다.
+        - 두 함수 모두 다음 인자를 받을 수 있다.
+            - 반환할 칼럼
+            - 몇 칸 앞뒤를 볼지 나타내는 offset
+            - 값이 없을 때 사용할 기본값
+    - 11.4.12.4 윈도우 함수와 성능
+        - MySQL의 윈도우 함수는 아직 인덱스를 이용한 최적화가 부족한 부분이 있다.
+        - 예시에서는 MAX(from_date) OVER(PARTITION BY emp_no)와 SELECT MAX(from_date) ... GROUP BY emp_no를 비교한다.
+        - 실행 계획상 윈도우 함수 쿼리는 인덱스를 풀 스캔하고 Using filesort가 발생했다.
+        - 반면 GROUP BY 쿼리는 프라이머리 키를 사용해 Using index for group-by로 처리된다.
+        - 상태 값 비교에서도 윈도우 함수 쿼리가 훨씬 많은 레코드 읽기와 이동을 수행한 것으로 나타난다.
+        - GROUP BY 쿼리는 유니크한 emp_no별 결과만 만들면 되지만, 윈도우 함수 쿼리는 모든 레코드에 대해 결과 칼럼을 붙여야 하므로 작업량이 훨씬 크다.
+        - 다만 윈도우 함수는 SQL 표현력이 높고, GROUP BY로는 얻기 어려운 결과를 원본 행과 함께 반환할 수 있다는 장점이 있다.
