@@ -349,3 +349,137 @@
         - 대용량 데이터 복구에는 유리하다.
         - 하지만 InnoDB 시스템 테이블스페이스까지 통째로 다루므로 여러 소스 데이터를 한 서버로 합칠 때는 제약이 크다.
 - 그래서 여러 소스 데이터를 초기 적재할 때는 `mysqldump`와 XtraBackup을 상황에 따라 섞어 쓰는 것이 현실적이다.
+
+## 16.7 복제 고급 설정
+
+- 복제 고급 설정은 운영 중 복구 가능성, 복제 지연 완화, 장애 후 재시작 안정성, 특정 데이터만 복제하는 제어를 위한 기능이다.
+- 핵심 기능은 지연된 복제, 멀티 스레드 복제, 크래시 세이프 복제, 필터링된 복제다.
+
+### 16.7.1 지연된 복제(Delayed Replication)
+
+- 지연된 복제는 레플리카가 소스 서버의 트랜잭션을 즉시 적용하지 않고 지정된 시간만큼 늦게 적용하는 기능이다.
+- 실수로 데이터나 테이블을 삭제했을 때, 아직 삭제 이벤트가 적용되지 않은 레플리카에서 데이터를 복구할 수 있다.
+- 지연 복제에서도 소스 서버의 바이너리 로그는 레플리카의 릴레이 로그로 즉시 복사된다. 지연되는 것은 SQL 스레드가 릴레이 로그 이벤트를 실행하는 시점이다.
+- 설정 옵션은 다음과 같다.
+    - MySQL 8.0.23 미만: `MASTER_DELAY`
+    - MySQL 8.0.23 이상: `SOURCE_DELAY`
+
+```
+CHANGE MASTERTO MASTER_DELAY=86400;
+CHANGE REPLICATION SOURCETO SOURCE_DELAY=86400;
+```
+
+- MySQL 8.0부터 바이너리 로그에는 두 타임스탬프가 기록된다.
+    - `original_commit_timestamp(OCT)`: 원본 소스 서버에서 커밋된 시각이다.
+    - `immediate_commit_timestamp(ICT)`: 직계 소스 서버에서 커밋된 시각이다.
+- 체인 복제에서는 OCT와 ICT가 다를 수 있으며, MySQL 8.0은 ICT 기준으로 지연을 계산해 이전 버전의 이벤트 단위 지연 문제를 개선했다.
+
+### 16.7.2 멀티 스레드 복제(Multi-threaded Replication)
+
+- 멀티 스레드 복제는 레플리카 서버에서 복제 이벤트를 여러 워커 스레드가 병렬로 처리하는 기능이다.
+- 단일 스레드 복제에서는 소스 서버에서 동시에 실행된 DML도 레플리카에서 순차 적용되어 복제 지연이 쉽게 발생한다.
+- 멀티 스레드 복제에서는 SQL 스레드가 코디네이터가 되고, 실제 이벤트 실행은 워커 스레드가 담당한다.
+
+<img width="874" height="298" alt="image" src="https://github.com/user-attachments/assets/9cf116aa-d1f3-438e-a819-d6b647059148" />
+
+- 핵심 시스템 변수는 다음과 같다.
+    - `slave_parallel_type`: 병렬 처리 방식이다.
+    - `slave_parallel_workers`: 워커 스레드 수다.
+    - `slave_pending_jobs_size_max`: 워커 큐에 할당 가능한 최대 메모리 크기다.
+- `slave_parallel_workers=0`은 단일 스레드 복제다.
+- `slave_parallel_workers=1`은 워커가 하나지만 코디네이터 비용이 추가되므로, 단일 스레드 목적이면 0을 사용한다.
+
+### 16.7.2.1 데이터베이스 기반 멀티 스레드 복제
+
+- 데이터베이스 기반 방식은 데이터베이스 단위로 이벤트를 나눠 병렬 처리한다.
+    
+    <img width="818" height="524" alt="image" src="https://github.com/user-attachments/assets/60ce680a-d8a4-4713-b8df-b48b9ed9ad47" />
+
+- 데이터베이스가 하나뿐이면 병렬 처리 이점이 거의 없다.
+- 여러 데이터베이스가 있고 각 데이터베이스의 DML이 독립적으로 발생하는 환경에서는 효과가 있다.
+- 같은 데이터베이스에 대한 이벤트는 실제로 다른 테이블이나 다른 레코드를 변경하더라도 병렬 처리되지 않을 수 있다.
+    
+    <img width="650" height="408" alt="image" src="https://github.com/user-attachments/assets/59fee1f1-62a3-4779-9674-349a884bc0ac" />
+
+
+```
+slave_parallel_type='DATABASE'
+slave_parallel_workers=N
+```
+
+- 이 방식에서는 레플리카 서버의 바이너리 로그 기록 순서가 소스 서버의 트랜잭션 순서와 달라질 수 있다.
+- 따라서 레플리카에서 특정 트랜잭션이 보인다고 해서 그 이전 트랜잭션이 모두 반영됐다고 단정하기 어렵다.
+
+### 16.7.2.2 LOGICAL CLOCK 기반 멀티 스레드 복제
+
+- `LOGICAL_CLOCK` 방식은 데이터베이스 단위가 아니라 트랜잭션 간 의존 관계를 기준으로 병렬 처리한다.
+- 같은 데이터베이스 안에서도 병렬 처리가 가능하므로 데이터베이스 기반 방식보다 활용도가 높다.
+- logical clock은 실제 시간이 아니라 이벤트 선후 관계를 판단하기 위한 논리적 순번이다.
+
+### 16.7.2.2.1 바이너리 로그 그룹 커밋
+
+<img width="582" height="484" alt="image" src="https://github.com/user-attachments/assets/0c72ad27-b067-4ed9-9b54-137824493564" />
+
+- MySQL은 스토리지 엔진 커밋과 바이너리 로그 기록의 일관성을 위해 Prepare와 Commit의 두 단계를 사용한다.
+- MySQL 5.6부터 바이너리 로그 그룹 커밋이 도입되어 여러 트랜잭션을 묶어 처리할 수 있게 됐다.
+
+<img width="832" height="290" alt="image" src="https://github.com/user-attachments/assets/914f68b9-1113-4592-8bb6-945a6378b77c" />
+
+- 그룹 커밋 관련 핵심 변수는 다음과 같다.
+    - `binlog_group_commit_sync_delay`: 바이너리 로그 동기화를 지연할 시간이다.
+    - `binlog_group_commit_sync_no_delay_count`: 지연 시간과 관계없이 대기 가능한 최대 트랜잭션 수다.
+    - `binlog_order_commits`: 바이너리 로그 기록 순서대로 스토리지 엔진 커밋을 수행할지 제어한다.
+
+### 16.7.2.2.2 Commit-parent 기반 LOGICAL CLOCK 방식
+
+- Commit-parent 방식은 같은 시점에 커밋된 트랜잭션을 레플리카에서 병렬 실행할 수 있게 하는 방식이다.
+- 같은 `commit_seq_no`를 가진 트랜잭션은 병렬 처리 가능하다.
+- 그룹 커밋 트랜잭션 수가 많을수록 레플리카 병렬 처리율이 높아진다.
+- 이를 늘리기 위해 그룹 커밋 지연 값을 조정할 수 있지만, 소스 서버의 클라이언트 응답이 느려질 수 있다.
+
+### 16.7.2.2.3 잠금(Lock) 기반 LOGICAL CLOCK 방식
+
+- 잠금 기반 방식은 MySQL 5.7.6부터 사용된다.
+- 커밋 시점이 완전히 같지 않아도 커밋 처리 구간이 겹치면 병렬 처리 가능하다고 판단한다.
+- 바이너리 로그에는 다음 값이 기록된다.
+    - `sequence_number`: 트랜잭션의 논리적 순번이다.
+    - `last_committed`: 해당 트랜잭션 이전에 커밋된 최신 트랜잭션의 순번이다.
+- 커밋 처리 시점이 겹치는 트랜잭션이 많을수록 병렬 처리 가능성이 커진다.
+- 이 방식도 그룹 커밋 설정의 영향을 받는다.
+
+### 16.7.2.2.4 WriteSet 기반 LOGICAL CLOCK 방식
+
+- WriteSet 방식은 MySQL 8.0.1에서 도입됐다.
+- 커밋 시점이 아니라 트랜잭션이 변경한 데이터를 기준으로 병렬 처리 가능 여부를 판단한다.
+- 서로 다른 데이터를 변경한 트랜잭션은 병렬 실행할 수 있다.
+- 병렬성을 가장 크게 개선하지만, 변경 데이터 해시 계산과 히스토리 비교 비용이 추가된다.
+
+```
+binlog_format=ROW
+binlog_transaction_dependency_tracking={WRITESET|WRITESET_SESSION}
+transaction_write_set_extraction=XXHASH64
+
+slave_parallel_type=LOGICAL_CLOCK
+slave_parallel_workers=N
+```
+
+- `binlog_transaction_dependency_tracking` 값은 다음과 같다.
+    - `COMMIT_ORDER`: 기존 잠금 기반 방식이다.
+    - `WRITESET`: 서로 다른 데이터를 변경한 트랜잭션을 병렬 처리한다.
+    - `WRITESET_SESSION`: 같은 세션의 트랜잭션은 병렬 처리하지 않는다.
+- `transaction_write_set_extraction`은 WriteSet 해시 알고리즘을 지정한다.
+    - `OFF`
+    - `MURMUR32`
+    - `XXHASH64`
+- WriteSet은 테이블의 유니크 키 기준으로 생성된다. PRIMARY KEY도 포함된다.
+
+### 16.7.2.3 멀티 스레드 복제와 복제 포지션 정보
+
+- 멀티 스레드 복제에서는 여러 워커가 이벤트를 병렬 처리하므로 완료 순서가 릴레이 로그 순서와 다를 수 있다.
+- 워커별 포지션 정보는 `relay_log_info_repository` 설정에 따라 테이블 또는 파일에 저장된다.
+- 복제 상태에서 보이는 포지션은 항상 최신 실행 위치가 아니라 체크포인트 기준일 수 있다.
+- `slave_preserve_commit_order=1`이면 레플리카에서 소스 서버 커밋 순서와 동일한 순서로 커밋한다.
+- 이 설정은 트랜잭션 갭을 줄이고 크래시 세이프 복제에도 유리하다.
+- 체크포인트 관련 변수는 다음과 같다.
+    - `slave_checkpoint_period`: 체크포인트 실행 주기다.
+    - `slave_checkpoint_group`: 트랜잭션 개수 기준 체크포인트 주기다.
