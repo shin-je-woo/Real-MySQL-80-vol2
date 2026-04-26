@@ -483,3 +483,148 @@ slave_parallel_workers=N
 - 체크포인트 관련 변수는 다음과 같다.
     - `slave_checkpoint_period`: 체크포인트 실행 주기다.
     - `slave_checkpoint_group`: 트랜잭션 개수 기준 체크포인트 주기다.
+
+### 16.7.3 크래시 세이프 복제(Crash-safe Replication)
+
+- 크래시 세이프 복제는 MySQL이 비정상 종료된 후에도 복제가 일관되게 재개되도록 하는 설정이다.
+- 복제 포지션 정보와 실제 처리된 이벤트가 불일치하면 동일 이벤트가 중복 실행되거나 누락될 수 있다.
+- 대표적인 결과가 `Duplicate key` 오류다.
+
+### 16.7.3.1 서버 장애와 복제 실패
+
+<img width="766" height="506" alt="image" src="https://github.com/user-attachments/assets/79b84403-c5c0-4db1-9686-35c74913d3f5" />
+
+- I/O 스레드와 SQL 스레드는 각각 어디까지 가져왔고 적용했는지 포지션 정보를 남긴다.
+- 파일 기반 포지션 정보는 이벤트 처리와 포지션 갱신이 원자적으로 묶이지 않아 비정상 종료 시 불일치가 생길 수 있다.
+- MySQL 5.6부터 포지션 정보를 TABLE로 관리할 수 있다.
+- SQL 스레드는 트랜잭션 적용과 포지션 정보 갱신을 하나의 트랜잭션으로 묶을 수 있다.
+    
+    <img width="680" height="392" alt="image" src="https://github.com/user-attachments/assets/2be6ebf7-6995-4563-b76e-9171827473e6" />
+
+- I/O 스레드는 릴레이 로그 파일 쓰기와 포지션 갱신을 완전히 원자적으로 묶기 어렵다.
+- 그래서 `relay_log_recovery=ON`이 필요하다.
+- 크래시 세이프 복제의 최소 핵심 설정은 다음과 같다.
+
+```
+relay_log_recovery=ON
+relay_log_info_repository=TABLE
+```
+
+- MySQL 8.0에서는 `relay_log_info_repository` 기본값이 `TABLE`이다.
+- 이 설정은 MySQL 서버 비정상 종료에 대한 복구를 돕는 것이며, 운영체제나 장비 크래시로 데이터 파일 자체가 손상되는 상황까지 보장하지는 않는다.
+
+### 16.7.3.2 복제 사용 형태별 크래시 세이프 복제 설정
+
+16.7.3.2.1 파일 위치 기반 복제와 싱글 스레드 동기화
+
+```
+relay_log_recovery=ON
+relay_log_info_repository=TABLE
+```
+
+- 파일 위치 기반 복제와 싱글 스레드 복제에서는 위 설정이 기본 크래시 세이프 설정이다.
+
+16.7.3.2.2 파일 위치 기반 복제와 멀티 스레드 동기화
+
+- 커밋 순서가 소스 서버와 일치하면 다음 설정이 핵심이다.
+
+```
+relay_log_recovery=ON
+relay_log_info_repository=TABLE
+slave_parallel_type=LOGICAL_CLOCK
+slave_preserve_commit_order=1
+```
+
+- 커밋 순서가 일치하지 않으면 `sync_relay_log=1`이 필요할 수 있다.
+
+```
+relay_log_recovery=ON
+relay_log_info_repository=TABLE
+sync_relay_log=1
+```
+
+- 실무적으로는 `LOGICAL_CLOCK`과 `slave_preserve_commit_order=1`을 사용해 갭이 생기지 않게 하는 구성이 권장된다.
+
+16.7.3.2.3 GTID 기반 복제와 싱글 스레드 동기화
+
+- GTID 기반 복제에서는 자동 포지션 옵션이 핵심이다.
+
+```
+relay_log_recovery=ON
+MASTER_AUTO_POSITION=1
+SOURCE_AUTO_POSITION=1
+```
+
+- MySQL 8.0.23 미만은 `MASTER_AUTO_POSITION=1`, MySQL 8.0.23 이상은 `SOURCE_AUTO_POSITION=1`을 사용한다.
+- 이 경우 복구 시 `mysql.slave_relay_log_info`가 아니라 `mysql.gtid_executed`를 참조한다.
+- `gtid_executed`가 매 트랜잭션 적용 시 함께 갱신되지 않는 환경에서는 다음 설정도 필요하다.
+
+```
+sync_binlog=1
+innodb_flush_log_at_trx_commit=1
+```
+
+16.7.3.2.4 GTID 기반 복제와 멀티 스레드 동기화
+
+- 기본 설정은 GTID 기반 싱글 스레드 동기화와 같다.
+- MySQL 8.0.18과 5.7.28부터는 GTID 기반이면서 AUTO_POSITION을 사용하면 불필요한 트랜잭션 갭 메우기 작업이 자동으로 생략된다.
+- 이전 버전에서는 릴레이 로그 이벤트 손실로 복구가 실패할 수 있으며, 이때는 다음처럼 복제를 초기화해 재개할 수 있다.
+
+```
+STOP SLAVE;
+RESET SLAVE;
+START SLAVE;
+```
+
+### 16.7.4 필터링된 복제(Filtered Replication)
+
+- 필터링된 복제는 소스 서버의 특정 이벤트만 레플리카 서버에 적용되도록 제한하는 기능이다.
+- 필터링은 소스 서버와 레플리카 서버 양쪽에서 설정할 수 있다.
+- 소스 서버 필터링은 바이너리 로그 기록 단계에서 적용된다.
+- 레플리카 서버 필터링은 릴레이 로그 이벤트 실행 단계에서 적용된다.
+
+### 소스 서버 필터링
+
+- 소스 서버 필터링은 데이터베이스 단위로만 가능하다.
+- 주요 옵션은 다음과 같다.
+    - `binlog-do-db`: 지정한 데이터베이스 이벤트만 바이너리 로그에 기록한다.
+    - `binlog-ignore-db`: 지정한 데이터베이스 이벤트를 바이너리 로그에 기록하지 않는다.
+- 실행 중 동적 변경은 불가능하며, MySQL 시작 시 설정해야 한다.
+- 여러 데이터베이스를 지정할 때 쉼표로 나열하지 말고 옵션을 반복해서 지정해야 한다.
+
+```
+binlog-do-db=db1
+binlog-do-db=db2
+```
+
+### 레플리카 서버 필터링
+
+- 레플리카 서버 필터링은 소스 서버 필터링보다 유연하며, 동적으로 변경할 수 있다.
+- 핵심 명령은 `CHANGE REPLICATION FILTER`다.
+
+```
+CHANGE REPLICATION FILTER filter[, filter, ...] [FOR CHANNEL channel_name]
+```
+
+- 주요 필터 옵션은 다음과 같다.
+    - `REPLICATE_DO_DB`: 복제 대상 데이터베이스를 지정한다.
+    - `REPLICATE_IGNORE_DB`: 복제 제외 데이터베이스를 지정한다.
+    - `REPLICATE_DO_TABLE`: 복제 대상 테이블을 지정한다.
+    - `REPLICATE_IGNORE_TABLE`: 복제 제외 테이블을 지정한다.
+    - `REPLICATE_WILD_DO_TABLE`: 와일드카드로 복제 대상 테이블을 지정한다.
+    - `REPLICATE_WILD_IGNORE_TABLE`: 와일드카드로 복제 제외 테이블을 지정한다.
+    - `REPLICATE_REWRITE_DB`: 특정 데이터베이스명을 다른 데이터베이스명으로 치환해 적용한다.
+- 이미 복제가 실행 중이면 SQL 스레드를 멈추고 필터를 설정한 뒤 다시 시작해야 한다.
+- `CHANGE REPLICATION FILTER`로 설정한 값은 MySQL 재시작 시 초기화된다. 유지하려면 설정 파일에 작성해야 한다.
+
+### 바이너리 로그 포맷과 필터링 주의점
+
+- 필터링 복제에서 가장 중요한 주의점은 바이너리 로그 포맷에 따라 같은 쿼리도 필터링 결과가 달라질 수 있다는 것이다.
+- Statement 포맷은 `USE` 문으로 지정된 디폴트 데이터베이스를 기준으로 필터링한다.
+- Row 포맷은 실제 변경된 테이블이 속한 데이터베이스를 기준으로 필터링한다.
+- DDL은 Row 포맷에서도 Statement 포맷처럼 로깅되므로 `USE` 문 기준의 영향을 받는다.
+- 따라서 필터링을 일관되게 사용하려면 다음을 지켜야 한다.
+    - Row 포맷 사용 시 DDL은 `USE` 문으로 디폴트 데이터베이스를 설정하고, 쿼리에서 데이터베이스명을 직접 지정하지 않는다.
+    - Statement 또는 Mixed 포맷 사용 시 DML과 DDL 모두 `USE` 문으로 디폴트 데이터베이스를 설정하고, 쿼리에서 데이터베이스명을 직접 지정하지 않는다.
+    - Statement 또는 Mixed 포맷 사용 시 복제 대상 테이블과 복제 제외 테이블을 함께 변경하는 DML을 사용하지 않는다.
+- 소스 서버에서 `binlog-do-db` 또는 `binlog-ignore-db`를 사용하는 경우도 바이너리 로그 포맷에 따라 결과가 달라질 수 있다.
